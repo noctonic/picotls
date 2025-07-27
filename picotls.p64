@@ -1,0 +1,2590 @@
+picotron cartridge // www.picotron.net
+version 2
+
+:: crypto/
+:: crypto/aead_chacha20_poly1305.lua
+--[[pod_format="raw",created="2025-07-27 10:10:10",modified="2025-07-27 10:10:10",revision=0]]
+local M = {}
+M.TAG_SIZE = 16
+
+local function tohex(buf)
+  if type(buf) == "string" then
+    local t = {}
+    for i=1,#buf do
+      t[#t+1] = string.format("%02x", ord(buf,i))
+    end
+    return table.concat(t, "")
+  elseif type(buf) == "userdata" then
+    local t = {}
+    for i=0,#buf-1 do
+      t[#t+1] = string.format("%02x", buf:get(i))
+    end
+    return table.concat(t, "")
+  else
+    return tostring(buf)
+  end
+end
+
+local function to_userdata(data)
+  if type(data) == "string" then
+    local u = userdata("u8", #data)
+    if #data > 0 then
+      u:set(0, ord(data, 1, #data))
+    end
+    return u
+  elseif type(data) == "userdata" then
+    data:mutate("u8", #data)
+    return data
+  else
+    error("[aead_chacha20_poly1305]: expected string or userdata")
+  end
+end
+
+local function gen_poly_key(key, nonce)
+  local ctx = chacha20.new(key, nonce, 0)
+  local block = ctx:ucrypt(string.rep("\0", 64))
+  local k = userdata("u8", 32)
+  k:set(0, block:get(0, 32))
+  return k
+end
+
+local function pad16(len)
+  local rem = len % 16
+  if rem == 0 then return nil end
+  return userdata("u8", 16 - rem)
+end
+
+local function poly_tag(poly_key, aad, ciphertext)
+  local a = to_userdata(aad or "")
+  local c = to_userdata(ciphertext or "")
+  local p = poly1305.new(poly_key)
+  p:update(a)
+  local pad = pad16(#a)
+  if pad then p:update(pad) end
+  p:update(c)
+  pad = pad16(#c)
+  if pad then p:update(pad) end
+  local lens = userdata("u8", 16)
+  local alen = #a
+  local clen = #c
+  for i=0,7 do
+    lens:set(i, alen & 0xff)
+    alen = alen >> 8
+  end
+  for i=0,7 do
+    lens:set(8+i, clen & 0xff)
+    clen = clen >> 8
+  end
+  p:update(lens)
+  return p:utag()
+end
+
+local function constant_time_eq(a, b)
+  local ua = to_userdata(a)
+  local ub = to_userdata(b)
+  if #ua ~= #ub then return false end
+  local diff = 0
+  for i=0,#ua-1 do
+    diff = diff | (ua:get(i) ~ ub:get(i))
+  end
+  return diff == 0
+end
+
+function M.useal(key, nonce, plaintext, aad)
+  local ct_ctx = chacha20.new(key, nonce, 1)
+  local cipher = ct_ctx:ucrypt(plaintext)
+  local poly_key = gen_poly_key(key, nonce)
+  local tag = poly_tag(poly_key, aad, cipher)
+  return cipher, tag
+end
+
+function M.seal(key, nonce, plaintext, aad)
+  local c, t = M.useal(key, nonce, plaintext, aad)
+  return chr(c:get()), chr(t:get())
+end
+
+function M.uopen(key, nonce, ciphertext, aad, tag)
+
+  local poly_key = gen_poly_key(key, nonce)
+  local expect = poly_tag(poly_key, aad, ciphertext)
+  if not constant_time_eq(tag, expect) then
+    return nil, "authentication failed"
+  end
+  local ctx = chacha20.new(key, nonce, 1)
+  local pt = ctx:ucrypt(ciphertext)
+  return pt
+end
+
+function M.open(key, nonce, ciphertext, aad, tag)
+  local pt, err = M.uopen(key, nonce, to_userdata(ciphertext), aad, to_userdata(tag))
+  if not pt then return nil, err end
+  return chr(pt:get())
+end
+
+return M
+
+:: crypto/chacha20.lua
+--[[pod_format="raw",created="2025-07-27 10:10:10",modified="2025-07-27 10:10:10",revision=0]]
+local M = {}
+M.BLOCK_SIZE = 64
+
+local function to_userdata(data)
+  if type(data) == "string" then
+    local u = userdata("u8", #data)
+    if #data > 0 then
+      u:set(0, ord(data, 1, #data))
+    end
+    return u
+  elseif type(data) == "userdata" then
+    data:mutate("u8", #data)
+    return data
+  else
+    error("[chacha20]: expected string or userdata")
+  end
+end
+
+local function rotl32(x, n)
+  x = x & 0xffffffff
+  return ((x << n) | (x >> (32 - n))) & 0xffffffff
+end
+
+local function quarterround(x, a,b,c,d)
+  local xa = x[a]
+  local xb = x[b]
+  local xc = x[c]
+  local xd = x[d]
+  xa = (xa + xb) & 0xffffffff
+  xd = rotl32(xd ~ xa, 16)
+  xc = (xc + xd) & 0xffffffff
+  xb = rotl32(xb ~ xc, 12)
+  xa = (xa + xb) & 0xffffffff
+  xd = rotl32(xd ~ xa, 8)
+  xc = (xc + xd) & 0xffffffff
+  xb = rotl32(xb ~ xc, 7)
+  x[a] = xa
+  x[b] = xb
+  x[c] = xc
+  x[d] = xd
+end
+
+local function chacha_block(state, tmp)
+  tmp:set(0, state:get(0,16))
+  for _=1,10 do
+    quarterround(tmp,0,4,8,12)
+    quarterround(tmp,1,5,9,13)
+    quarterround(tmp,2,6,10,14)
+    quarterround(tmp,3,7,11,15)
+    quarterround(tmp,0,5,10,15)
+    quarterround(tmp,1,6,11,12)
+    quarterround(tmp,2,7,8,13)
+    quarterround(tmp,3,4,9,14)
+  end
+  for i=0,15 do
+    tmp[i] = (tmp[i] + state[i]) & 0xffffffff
+  end
+  local out = userdata("u8",64)
+  for i=0,15 do
+    local v = tmp[i]
+    out:set(i*4, v & 0xff, (v>>8)&0xff, (v>>16)&0xff, (v>>24)&0xff)
+  end
+  return out
+end
+
+local function new_ctx(key, nonce, counter)
+  local k = to_userdata(key)
+  assert(#k == 32, "chacha20 key must be 32 bytes")
+  local n = to_userdata(nonce)
+  assert(#n == 12, "chacha20 nonce must be 12 bytes")
+  counter = counter or 0
+  local ctx = {
+    state = userdata("i32",16),
+    buffer = userdata("u8",64),
+    buffer_len = 0,
+    tmp = userdata("i32",16),
+  }
+  ctx.state:set(0,
+    0x61707865,0x3320646e,0x79622d32,0x6b206574,
+    k:get(0) | (k:get(1)<<8) | (k:get(2)<<16) | (k:get(3)<<24),
+    k:get(4) | (k:get(5)<<8) | (k:get(6)<<16) | (k:get(7)<<24),
+    k:get(8) | (k:get(9)<<8) | (k:get(10)<<16) | (k:get(11)<<24),
+    k:get(12)| (k:get(13)<<8)| (k:get(14)<<16)| (k:get(15)<<24),
+    k:get(16)| (k:get(17)<<8)| (k:get(18)<<16)| (k:get(19)<<24),
+    k:get(20)| (k:get(21)<<8)| (k:get(22)<<16)| (k:get(23)<<24),
+    k:get(24)| (k:get(25)<<8)| (k:get(26)<<16)| (k:get(27)<<24),
+    k:get(28)| (k:get(29)<<8)| (k:get(30)<<16)| (k:get(31)<<24),
+    counter & 0xffffffff,
+    n:get(0) | (n:get(1)<<8) | (n:get(2)<<16) | (n:get(3)<<24),
+    n:get(4) | (n:get(5)<<8) | (n:get(6)<<16) | (n:get(7)<<24),
+    n:get(8) | (n:get(9)<<8) | (n:get(10)<<16) | (n:get(11)<<24)
+  )
+  return ctx
+end
+
+local function keystream(ctx)
+  local out = chacha_block(ctx.state, ctx.tmp)
+  ctx.state:set(12, (ctx.state:get(12)+1) & 0xffffffff)
+  return out
+end
+
+local function crypt(ctx, chunk)
+  local msg = to_userdata(chunk)
+  local out = userdata("u8", #msg)
+  local offset = 0
+  while offset < #msg do
+    if ctx.buffer_len == 0 then
+      ctx.buffer = keystream(ctx)
+      ctx.buffer_len = 64
+    end
+    local n = math.min(ctx.buffer_len, #msg - offset)
+    msg:bxor(ctx.buffer, out, 64 - ctx.buffer_len, offset, n)
+    ctx.buffer_len = ctx.buffer_len - n
+    offset = offset + n
+  end
+  return out
+end
+
+function M.new(key, nonce, counter)
+  local ctx = new_ctx(key, nonce, counter)
+
+  function ctx:ucrypt(data)
+    return crypt(ctx, data)
+  end
+
+  function ctx:scrypt(data)
+    local ud = crypt(ctx, data)
+    return chr(ud:get(0, #ud))
+  end
+
+  ctx.crypt = ctx.ucrypt
+
+  return ctx
+end
+
+return M
+
+:: crypto/constants.lua
+--[[pod_format="raw",created="2025-07-27 10:10:10",modified="2025-07-27 10:10:10",revision=0]]
+local M = {}
+
+-- TLS record layer content types
+M.content_type = {
+  change_cipher_spec = 20,
+  alert = 21,
+  handshake = 22,
+  application_data = 23,
+}
+
+-- TLS handshake message types
+M.handshake_type = {
+  client_hello         = 1,
+  server_hello         = 2,
+  new_session_ticket   = 4,
+  end_of_early_data    = 5,
+  hello_retry_request  = 6,
+  encrypted_extensions = 8,
+  certificate          = 11,
+  certificate_request  = 13,
+  certificate_verify   = 15,
+  finished             = 20,
+  key_update           = 24,
+  message_hash         = 254,
+}
+
+-- Alert levels
+M.alert_level = {
+  warning = 1,
+  fatal   = 2,
+}
+
+-- Alert descriptions
+M.alert_description = {
+  close_notify = 0,
+}
+
+-- TLS protocol versions
+M.version = {
+  SSL3   = 0x0300,
+  TLS1_0 = 0x0301,
+  TLS1_1 = 0x0302,
+  TLS1_2 = 0x0303,
+  TLS1_3 = 0x0304,
+}
+
+-- Cipher suite
+M.cipher_suite = {
+  TLS_AES_128_GCM_SHA256       = 0x1301,
+  TLS_AES_256_GCM_SHA384       = 0x1302,
+  TLS_CHACHA20_POLY1305_SHA256 = 0x1303,
+  TLS_AES_128_CCM_SHA256       = 0x1304,
+  TLS_AES_128_CCM_8_SHA256     = 0x1305,
+}
+
+-- Extension type
+M.extension_type = {
+  server_name               = 0,
+  max_fragment_length       = 1,
+  status_request            = 5,
+  supported_groups          = 10,
+  signature_algorithms      = 13,
+  application_layer_protocol_negotiation = 16,
+  record_size_limit         = 28,
+  renegotiation_info        = 0xff01,
+  pre_shared_key            = 41,
+  early_data                = 42,
+  supported_versions        = 43,
+  cookie                    = 44,
+  psk_key_exchange_modes    = 45,
+  certificate_authorities   = 47,
+  oid_filters               = 48,
+  post_handshake_auth       = 49,
+  signature_algorithms_cert = 50,
+  key_share                 = 51,
+}
+
+-- Named group identifiers (supported_groups / key_share)
+M.named_group = {
+  secp256r1 = 23,
+  secp384r1 = 24,
+  secp521r1 = 25,
+  x25519    = 29,
+  x448      = 30,
+  ffdhe2048 = 256,
+}
+
+-- Signature scheme identifiers
+M.signature_scheme = {
+  rsa_pkcs1_sha256         = 0x0401,
+  rsa_pkcs1_sha384         = 0x0501,
+  rsa_pkcs1_sha512         = 0x0601,
+  ecdsa_secp256r1_sha256   = 0x0403,
+  ecdsa_secp384r1_sha384   = 0x0503,
+  ecdsa_secp521r1_sha512   = 0x0603,
+  rsa_pss_rsae_sha256      = 0x0804,
+  rsa_pss_rsae_sha384      = 0x0805,
+  rsa_pss_rsae_sha512      = 0x0806,
+  ed25519                  = 0x0807,
+  ed448                    = 0x0808,
+  rsa_pss_pss_sha256       = 0x0809,
+  rsa_pss_pss_sha384       = 0x080A,
+  rsa_pss_pss_sha512       = 0x080B,
+}
+
+-- PSK key exchange modes
+M.psk_key_exchange_mode = {
+  psk_ke = 0,
+  psk_dhe_ke = 1,
+}
+
+return M
+
+:: crypto/crypto.lua
+--[[pod_format="raw",created="2025-07-27 10:10:10",modified="2025-07-27 10:10:10",revision=0]]
+constants = include("./crypto/constants.lua")
+rng = include("./crypto/rng.lua")
+chacha20 = include("./crypto/chacha20.lua")
+x25519 = include("./crypto/x25519.lua")
+poly1305 = include("./crypto/poly1305.lua")
+sha256 = include("./crypto/sha256.lua")
+hmac = include("./crypto/hmac_sha256.lua")
+extensions = include("./crypto/extensions.lua")
+aead = include("./crypto/aead_chacha20_poly1305.lua")
+hkdf = include("./crypto/hkdf.lua")
+key_schedule = include("./crypto/key_schedule.lua")
+handshake = include("./crypto/handshake.lua")
+record_utils = include("./crypto/record_utils.lua")
+record = include("./crypto/record.lua")
+tls = include("./crypto/tls_socket.lua")
+
+:: crypto/extensions.lua
+--[[pod_format="raw",created="2025-07-27 10:10:10",modified="2025-07-27 10:10:10",revision=0]]
+local M = {}
+
+local function u16(n)
+  return chr((n >> 8) & 0xff, n & 0xff)
+end
+
+function M.supported_groups(groups)
+  local t = {}
+  for i, g in ipairs(groups) do t[#t+1] = u16(g) end
+  local body = u16(#t * 2) .. table.concat(t)
+  return u16(constants.extension_type.supported_groups) ..
+         u16(#body) .. body
+end
+
+function M.key_share(group, pub)
+  local share = u16(group) .. u16(#pub) .. pub
+  local body  = u16(#share) .. share
+  return u16(constants.extension_type.key_share) ..
+         u16(#body) .. body
+end
+
+function M.signature_algorithms(algs)
+  local t = {}
+  for i, a in ipairs(algs) do t[#t+1] = u16(a) end
+  local body = u16(#t * 2) .. table.concat(t)
+  return u16(constants.extension_type.signature_algorithms) ..
+         u16(#body) .. body
+end
+
+function M.supported_versions(versions)
+  local t = {}
+  for i, v in ipairs(versions) do t[#t+1] = u16(v) end
+  local body = chr(#t * 2) .. table.concat(t)
+  return u16(constants.extension_type.supported_versions) ..
+         u16(#body) .. body
+end
+
+function M.server_name(hostname)
+  local name = chr(0) .. u16(#hostname) .. hostname
+  local list = u16(#name) .. name
+  return u16(constants.extension_type.server_name) ..
+         u16(#list) .. list
+end
+
+function M.psk_key_exchange_modes(modes)
+  local t = {}
+  for i, m in ipairs(modes) do t[#t+1] = chr(m) end
+  local body = chr(#t) .. table.concat(t)
+  return u16(constants.extension_type.psk_key_exchange_modes) ..
+         u16(#body) .. body
+end
+
+function M.pre_shared_key(identity, binder_len)
+  local id = u16(#identity) .. identity .. chr(0,0,0,0)
+  local ids = u16(#id) .. id
+  local binder = string.rep("\0", binder_len)
+  local binders = u16(1 + binder_len) .. chr(#binder) .. binder
+  local body = ids .. binders
+  local ext = u16(constants.extension_type.pre_shared_key) ..
+              u16(#body) .. body
+  local offset = #ext - binder_len + 1
+  return ext, offset
+end
+
+function M.alpn(protocols)
+  local t = {}
+  for i, p in ipairs(protocols) do
+    t[#t+1] = chr(#p) .. p
+  end
+  local list = table.concat(t)
+  local body = u16(#list) .. list
+  return u16(constants.extension_type.application_layer_protocol_negotiation) ..
+         u16(#body) .. body
+end
+
+return M
+
+:: crypto/handshake.lua
+--[[pod_format="raw",created="2025-07-27 10:10:10",modified="2025-07-27 10:10:10",revision=0]]
+local M = {}
+
+local function to_udata(data)
+  if type(data) == "string" then
+    local u = userdata("u8", #data)
+    if #data > 0 then u:set(0, ord(data, 1, #data)) end
+    return u
+  elseif type(data) == "userdata" then
+    data:mutate("u8", #data)
+    return data
+  else
+    error("[handshake]: expected string or userdata")
+  end
+end
+local function tohex(buf)
+  local t = {}
+  if type(buf) == "userdata" then
+    for i=0,#buf-1 do
+      t[#t+1] = string.format("%02x", buf:get(i))
+    end
+  else
+    for i=1,#buf do
+      t[#t+1] = string.format("%02x", ord(buf,i))
+    end
+  end
+  return table.concat(t, "")
+end
+
+local function ud_to_str(u)
+  return chr(u:get(0, #u))
+end
+local function u16(n)
+  return chr((n >> 8) & 0xff, n & 0xff)
+end
+
+local function u24(n)
+  return chr((n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff)
+end
+
+local function parse_u8(buf, pos)
+  return buf:get(pos), pos + 1
+end
+
+local function parse_u16(buf, pos)
+  local hi = buf:get(pos)
+  local lo = buf:get(pos + 1)
+  return (hi << 8) | lo, pos + 2
+end
+
+local function parse_u24(buf, pos)
+  local b1 = buf:get(pos)
+  local b2 = buf:get(pos + 1)
+  local b3 = buf:get(pos + 2)
+  return (b1 << 16) | (b2 << 8) | b3, pos + 3
+end
+
+local function ext_supported_versions(versions)
+  return extensions.supported_versions(versions)
+end
+
+local function ext_server_name(host)
+  if not host then return "" end
+  return extensions.server_name(host)
+end
+
+function M.new(opts)
+  opts = opts or {}
+  local self = {}
+  
+  self.cipher_suites = {
+    
+    constants.cipher_suite.TLS_CHACHA20_POLY1305_SHA256,
+    
+  }
+  self.supported_groups = opts.supported_groups or {
+    constants.named_group.x25519,
+  }
+  self.signature_algorithms = opts.signature_algorithms or {
+    constants.signature_scheme.rsa_pss_rsae_sha256,
+    constants.signature_scheme.rsa_pkcs1_sha256,
+    constants.signature_scheme.ed25519,
+    constants.signature_scheme.ed448,
+  }
+  self.supported_versions = opts.supported_versions or {
+    constants.version.TLS1_3,
+  }
+  self.compatibility_mode = opts.compatibility_mode ~= false
+  self.psk = opts.psk
+  self.alpn = opts.alpn
+  if opts.client_random then
+    self.client_random = to_udata(opts.client_random)
+  else
+    self.client_random = rng.udata(32)
+  end
+
+  if opts.private_key then
+    self._priv = to_udata(opts.private_key)
+  else
+    self._priv = rng.udata(32)
+  end
+
+  self._pub = to_udata(x25519.scalar_base_mult(ud_to_str(self._priv)))
+  self.client_pub = self._pub
+  self.transcript = sha256.new()
+  return setmetatable(self, {__index=M})
+end
+
+function M:client_hello(host)
+  local suites = {}
+  for i=1,#self.cipher_suites do
+    suites[#suites+1] = u16(self.cipher_suites[i])
+  end
+  local suite_bytes = table.concat(suites)
+
+  
+  local exts = {}
+  if self.compatibility_mode then
+    exts[#exts+1] = {
+      constants.extension_type.renegotiation_info,
+      u16(constants.extension_type.renegotiation_info) .. u16(1) .. chr(0)
+    }
+  end
+  exts[#exts+1] = {constants.extension_type.server_name,
+                   ext_server_name(host)}
+  exts[#exts+1] = {constants.extension_type.supported_groups,
+                   extensions.supported_groups(self.supported_groups)}
+  exts[#exts+1] = {constants.extension_type.signature_algorithms,
+                   extensions.signature_algorithms(self.signature_algorithms)}
+  exts[#exts+1] = {constants.extension_type.supported_versions,
+                   ext_supported_versions(self.supported_versions)}
+  if self.alpn then
+    exts[#exts+1] = {constants.extension_type.application_layer_protocol_negotiation,
+                     extensions.alpn(self.alpn)}
+  end
+  exts[#exts+1] = {constants.extension_type.key_share,
+                   extensions.key_share(self.supported_groups[1], ud_to_str(self._pub))}
+  local binder_offset
+  if self.psk then
+    exts[#exts+1] = {
+      constants.extension_type.psk_key_exchange_modes,
+      extensions.psk_key_exchange_modes{
+        constants.psk_key_exchange_mode.psk_dhe_ke,
+      }
+    }
+    local psk_ext, off = extensions.pre_shared_key(
+      "Client_identity",
+      sha256.DIGEST_SIZE
+    )
+    exts[#exts+1] = {constants.extension_type.pre_shared_key, psk_ext, off}
+  end
+
+  local order = {
+    constants.extension_type.supported_versions,
+    constants.extension_type.supported_groups,
+    constants.extension_type.key_share,
+    constants.extension_type.signature_algorithms,
+  }
+  local map = {}
+  for _, e in ipairs(exts) do
+    map[e[1]] = e
+  end
+  local ext_parts = {}
+  local off = 0
+  for _, typ in ipairs(order) do
+    local e = map[typ]
+    if e then
+      ext_parts[#ext_parts+1] = e[2]
+      if typ == constants.extension_type.pre_shared_key then
+        binder_offset = off + (e[3] or 0)
+      end
+      off = off + #e[2]
+    end
+  end
+  local ext_body = table.concat(ext_parts)
+  local body_parts = {}
+  body_parts[#body_parts+1] = u16(constants.version.TLS1_2)
+  body_parts[#body_parts+1] = ud_to_str(self.client_random)
+  if self.compatibility_mode then
+    self.session_id = rng.udata(32)
+    body_parts[#body_parts+1] = chr(32) .. ud_to_str(self.session_id)
+  else
+    self.session_id = ""
+    body_parts[#body_parts+1] = chr(0)
+  end
+  body_parts[#body_parts+1] = u16(#suite_bytes)
+  body_parts[#body_parts+1] = suite_bytes
+  body_parts[#body_parts+1] = chr(1) .. chr(0) 
+  local body_prefix = table.concat(body_parts)
+  local body = body_prefix .. u16(#ext_body) .. ext_body
+
+  local msg = chr(constants.handshake_type.client_hello) ..
+              u24(#body) .. body
+  if self.psk then
+    local binder_start = 4 + #body_prefix + 2 + (binder_offset or 0)
+    local thash = sha256.new(msg):sdigest()
+    local bkey = key_schedule.binder_key(self.psk, true)
+    local binder = key_schedule.verify_data(bkey, thash)
+    msg = msg:sub(1, binder_start-1) .. binder .. msg:sub(binder_start + sha256.DIGEST_SIZE)
+  end
+  self.transcript:update(msg)
+  
+  return msg
+end
+
+local function parse_extensions(self, buf)
+  buf = to_udata(buf)
+  local pos = 0
+  while pos < #buf do
+    local typ; typ, pos = parse_u16(buf, pos)
+    local len; len, pos = parse_u16(buf, pos)
+    if typ == constants.extension_type.key_share then
+      local grp; grp, tmp = parse_u16(buf, pos)
+      local slen; slen, tmp = parse_u16(buf, pos + 2)
+      local share_ud = userdata("u8", slen)
+      share_ud:set(0, buf:get(pos + 4, slen))
+      self.server_group = grp
+      self.server_pub = share_ud
+    elseif typ == constants.extension_type.supported_versions then
+      local ver; ver, _ = parse_u16(buf, pos)
+      self.negotiated_version = ver
+    elseif typ == constants.extension_type.pre_shared_key then
+      local idx; idx, _ = parse_u16(buf, pos)
+      self.psk_index = idx
+    end
+    pos = pos + len
+  end
+end
+
+function M:process_server_hello(msg)
+  msg = to_udata(msg)
+  local pos = 0
+  
+  if msg:get(0) == constants.content_type.handshake then
+    
+    assert(#msg >= 5, "record too short")
+    local len = (msg:get(3) << 8) | msg:get(4)
+    assert(#msg >= 5 + len, "record length mismatch")
+    local tmp = userdata("u8", len)
+    tmp:set(0, msg:get(5, len))
+    msg = tmp
+  end
+
+  
+  local hlen; hlen, pos = parse_u24(msg, 1)
+  if #msg > 4 + hlen then
+    local tmp = userdata("u8", 4 + hlen)
+    tmp:set(0, msg:get(0, 4 + hlen))
+    msg = tmp
+  end
+
+  local typ = msg:get(0)
+  assert(typ == constants.handshake_type.server_hello,
+         "unexpected handshake message")
+  local len; len, pos = parse_u24(msg, 1)
+  assert(#msg == 4 + len, "handshake length mismatch")
+  local body = userdata("u8", len)
+  body:set(0, msg:get(4, len))
+  self.transcript:update(msg)
+  
+
+  pos = 0
+  local ver; ver, pos = parse_u16(body, pos)
+  local rand = userdata("u8", 32)
+  rand:set(0, body:get(pos, 32))
+  self.server_random = rand
+  pos = pos + 32
+  local sid_len; sid_len, pos = parse_u8(body, pos)
+  pos = pos + sid_len 
+  self.cipher_suite, pos = parse_u16(body, pos)
+  
+  pos = pos + 1 
+  local ext_len; ext_len, pos = parse_u16(body, pos)
+  local ext_ud = userdata("u8", ext_len)
+  ext_ud:set(0, body:get(pos, ext_len))
+  parse_extensions(self, ext_ud)
+  
+  assert(self.server_group == self.supported_groups[1],
+         "unsupported key share group")
+  local shared = x25519.scalar_mult(ud_to_str(self._priv), ud_to_str(self.server_pub))
+  self.schedule = key_schedule.new(shared, self.psk)
+  
+  local thash = self.transcript:sdigest()
+  
+  self.schedule:derive_handshake(thash)
+  return self.schedule
+end
+
+return M
+
+
+:: crypto/hkdf.lua
+--[[pod_format="raw",created="2025-07-27 10:10:10",modified="2025-07-27 10:10:10",revision=0]]
+local M = {}
+
+M.DIGEST_SIZE = hmac.DIGEST_SIZE
+
+local function to_userdata(data)
+  if type(data) == "string" then
+    local u = userdata("u8", #data)
+    if #data > 0 then
+      u:set(0, ord(data, 1, #data))
+    end
+    return u
+  elseif type(data) == "userdata" then
+    data:mutate("u8", #data)
+    return data
+  elseif data == nil then
+    return nil
+  else
+    error("[hkdf]: expected string or userdata")
+  end
+end
+
+local function zero_ud(len)
+  local u = userdata("u8", len)
+  for i=0,len-1 do
+    u:set(i, 0)
+  end
+  return u
+end
+
+function M.uextract(salt, ikm)
+  local s
+  if salt and #salt > 0 then
+    s = to_userdata(salt)
+  else
+    s = zero_ud(M.DIGEST_SIZE)
+  end
+  local ctx = hmac.new(s, ikm or "")
+  return ctx:udigest()
+end
+
+function M.extract(salt, ikm)
+  local ud = M.uextract(salt, ikm)
+  return chr(ud:get(0, #ud))
+end
+
+function M.uexpand(prk, info, len)
+  local key = to_userdata(prk)
+  local info_ud = info and to_userdata(info)
+  local out = userdata("u8", len)
+  local t = userdata("u8", M.DIGEST_SIZE)
+  local has_t = false
+  local offset = 0
+  local c = 0
+  while offset < len do
+    c = c + 1
+    assert(c <= 255, "output length too large")
+    local ctx = hmac.new(key)
+    if has_t then ctx:update(t) end
+    if info_ud and #info_ud > 0 then ctx:update(info_ud) end
+    ctx:update(chr(c))
+    local block = ctx:udigest()
+    t:set(0, block:get())
+    has_t = true
+    local n = math.min(M.DIGEST_SIZE, len - offset)
+    out:set(offset, block:get(0, n))
+    offset = offset + n
+  end
+  return out
+end
+
+function M.expand(prk, info, len)
+  local ud = M.uexpand(prk, info, len)
+  return chr(ud:get(0, #ud))
+end
+
+return M
+
+:: crypto/hmac_sha256.lua
+--[[pod_format="raw",created="2025-07-27 10:10:10",modified="2025-07-27 10:10:10",revision=0]]
+local M = {}
+
+M.DIGEST_SIZE = sha256.DIGEST_SIZE
+M.BLOCK_SIZE = sha256.BLOCK_SIZE
+
+local function to_userdata(data)
+  if type(data) == "string" then
+    local u = userdata("u8", #data)
+    if #data > 0 then
+      u:set(0, ord(data, 1, #data))
+    end
+    return u
+  elseif type(data) == "userdata" then
+    data:mutate("u8", #data)
+    return data
+  else
+    error("[hmac_sha256]: expected string or userdata")
+  end
+end
+
+local function init_ctx(ctx, key)
+  local k = to_userdata(key or "")
+  if #k > M.BLOCK_SIZE then
+    k = sha256.new(k):udigest()
+  else
+    local tmp = userdata("u8", #k)
+    if #k > 0 then
+      tmp:set(0, k:get(0, #k))
+    end
+    k = tmp
+  end
+  ctx.ipad = userdata("u8", M.BLOCK_SIZE)
+  ctx.opad = userdata("u8", M.BLOCK_SIZE)
+  for i=0,M.BLOCK_SIZE-1 do
+    local byte = i < #k and k:get(i) or 0
+    ctx.ipad:set(i, byte ~ 0x36)
+    ctx.opad:set(i, byte ~ 0x5c)
+  end
+  ctx.inner = sha256.new()
+  ctx.inner:update(ctx.ipad)
+  ctx._digest = nil
+end
+
+function M.new(key, data)
+  local ctx = {}
+  init_ctx(ctx, key)
+
+  function ctx:update(chunk)
+    ctx.inner:update(chunk)
+  end
+
+  function ctx:reset(new_key)
+    init_ctx(ctx, new_key or key)
+  end
+
+  function ctx:udigest()
+    if not ctx._digest then
+      local inner_hash = ctx.inner:udigest()
+      local outer = sha256.new()
+      outer:update(ctx.opad)
+      outer:update(inner_hash)
+      ctx._digest = outer:udigest()
+    end
+    return ctx._digest
+  end
+
+  function ctx:sdigest()
+    local ud = ctx:udigest()
+    return chr(ud:get())
+  end
+
+  function ctx:hexdigest()
+    local ud = ctx:udigest()
+    local t={}
+    for i=0,#ud-1 do
+      t[#t+1]=string.format("%02x", ud:get(i))
+    end
+    return table.concat(t, "")
+  end
+
+  if data then
+    ctx:update(data)
+  end
+
+  return ctx
+end
+
+return M
+
+:: crypto/key_schedule.lua
+--[[pod_format="raw",created="2025-07-27 10:10:10",modified="2025-07-27 10:10:10",revision=0]]
+local M = {}
+
+M.KEY_LEN = 32
+M.IV_LEN = 12
+
+local ZERO = string.rep("\0", hkdf.DIGEST_SIZE)
+
+local function build_label(label, context, len)
+  local full = "tls13 " .. label
+  local t = { (len >> 8) & 0xff, len & 0xff, #full }
+  for i=1,#full do
+    t[#t+1] = ord(full, i)
+  end
+  t[#t+1] = #context
+  for i=1,#context do
+    t[#t+1] = ord(context, i)
+  end
+  return chr(table.unpack(t))
+end
+
+function M.hkdf_expand_label(secret, label, context, len)
+  local info = build_label(label, context or "", len)
+  return hkdf.expand(secret, info, len)
+end
+
+function M.derive_secret(secret, label, transcript_hash)
+  return M.hkdf_expand_label(secret, label, transcript_hash or "", hkdf.DIGEST_SIZE)
+end
+
+function M.traffic_keys(secret)
+  local key = M.hkdf_expand_label(secret, "key", "", M.KEY_LEN)
+  local iv  = M.hkdf_expand_label(secret, "iv", "", M.IV_LEN)
+  return key, iv
+end
+
+function M.finished_key(secret)
+  return M.hkdf_expand_label(secret, "finished", "", hkdf.DIGEST_SIZE)
+end
+
+function M.verify_data(secret, hash)
+  local key = M.finished_key(secret)
+  local ctx = hmac.new(key)
+  ctx:update(hash)
+  local ud = ctx:udigest()
+  return chr(ud:get(0, #ud))
+end
+
+function M.binder_key(psk, is_ext)
+  local early = hkdf.extract(nil, psk)
+  local label = is_ext and "ext binder" or "res binder"
+  return M.derive_secret(early, label, "")
+end
+
+function M.new(shared_secret, psk)
+  local self = {}
+
+  if psk == nil or #psk == 0 then
+    self.psk = ZERO
+  else
+    self.psk = psk
+  end
+  self.shared_secret = shared_secret or ""
+
+  self.early_secret = hkdf.extract(nil, self.psk)
+  local empty_hash = sha256.new():sdigest()
+  local derived = M.derive_secret(self.early_secret, "derived", empty_hash)
+  self.handshake_secret = hkdf.extract(derived, self.shared_secret)
+  return setmetatable(self, { __index = M })
+end
+
+function M:derive_handshake(hash)
+  self.client_hs_secret = M.derive_secret(self.handshake_secret, "c hs traffic", hash)
+  self.server_hs_secret = M.derive_secret(self.handshake_secret, "s hs traffic", hash)
+  self.client_hs_key, self.client_hs_iv = M.traffic_keys(self.client_hs_secret)
+  self.server_hs_key, self.server_hs_iv = M.traffic_keys(self.server_hs_secret)
+  local empty_hash = sha256.new():sdigest()
+  local derived = M.derive_secret(self.handshake_secret, "derived", empty_hash)
+  self.master_secret = hkdf.extract(derived, ZERO)
+  return self.client_hs_key, self.client_hs_iv, self.server_hs_key, self.server_hs_iv
+end
+
+function M:derive_application(hash)
+  assert(self.master_secret, "master secret not set")
+  self.client_app_secret = M.derive_secret(self.master_secret, "c ap traffic", hash)
+  self.server_app_secret = M.derive_secret(self.master_secret, "s ap traffic", hash)
+  self.client_app_key, self.client_app_iv = M.traffic_keys(self.client_app_secret)
+  self.server_app_key, self.server_app_iv = M.traffic_keys(self.server_app_secret)
+  return self.client_app_key, self.client_app_iv, self.server_app_key, self.server_app_iv
+end
+
+return M
+
+:: crypto/poly1305.lua
+--[[pod_format="raw",created="2025-07-27 10:10:10",modified="2025-07-27 10:10:10",revision=0]]
+local M = {}
+
+local function to_userdata(data)
+  if type(data) == "string" then
+    local u = userdata("u8", #data)
+    if #data > 0 then
+      u:set(0, ord(data, 1, #data))
+    end
+    return u
+  elseif type(data) == "userdata" then
+    data:mutate("u8", #data)
+    return data
+  else
+    error("[poly1305]: expected string or userdata")
+  end
+end
+
+local BASE = 0x10000
+
+local function trim(t)
+  for i = #t, 1, -1 do
+    if t[i] ~= 0 then return t end
+    t[i] = nil
+  end
+  return t
+end
+
+local function bytes_to_bigint(bytes)
+  local out = {}
+  local j = 1
+  for i = 1, #bytes, 2 do
+    local lo = bytes[i]
+    local hi = bytes[i+1] or 0
+    out[j] = lo | (hi << 8)
+    j = j + 1
+  end
+  return trim(out)
+end
+
+local function bigint_to_bytes(bn, len)
+  local out = {}
+  local j = 1
+  for i=1, math.floor(len/2) do
+    local v = bn[i] or 0
+    out[j] = v & 0xff
+    out[j+1] = (v >> 8) & 0xff
+    j = j + 2
+  end
+  if len % 2 == 1 then
+    out[j] = (bn[math.floor(len/2)+1] or 0) & 0xff
+  end
+  return out
+end
+
+local function bigint_bitlen(a)
+  if #a == 0 then return 0 end
+  local top = a[#a]
+  local bits = (#a - 1) * 16
+  while top > 0 do
+    bits = bits + 1
+    top = top >> 1
+  end
+  return bits
+end
+
+local function bigint_add(a, b)
+  local out = {}
+  local carry = 0
+  local len = math.max(#a, #b)
+  for i=1, len do
+    local v = (a[i] or 0) + (b[i] or 0) + carry
+    out[i] = v % BASE
+    carry = math.floor((v - out[i]) / BASE)
+  end
+  if carry > 0 then out[len+1] = carry end
+  return trim(out)
+end
+
+local function bigint_add_small(a, s)
+  local out = {}
+  local carry = s
+  local i = 1
+  while carry > 0 or i <= #a do
+    local v = (a[i] or 0) + carry
+    out[i] = v % BASE
+    carry = math.floor((v - out[i]) / BASE)
+    i = i + 1
+  end
+  return trim(out)
+end
+
+local function bigint_sub(a, b)
+  local out = {}
+  local borrow = 0
+  for i=1, #a do
+    local v = (a[i] or 0) - (b[i] or 0) - borrow
+    if v < 0 then
+      v = v + BASE
+      borrow = 1
+    else
+      borrow = 0
+    end
+    out[i] = v
+  end
+  return trim(out)
+end
+
+local function bigint_cmp(a,b)
+  if #a > #b then return 1 end
+  if #a < #b then return -1 end
+  for i = #a,1,-1 do
+    local ai, bi = a[i] or 0, b[i] or 0
+    if ai > bi then return 1 end
+    if ai < bi then return -1 end
+  end
+  return 0
+end
+
+local function bigint_mul(a,b)
+  local out = {}
+  for i=1,#a+#b do out[i]=0 end
+  for i=1,#a do
+    local carry=0
+    for j=1,#b do
+      local idx=i+j-1
+      local v=out[idx] + a[i]*b[j] + carry
+      out[idx]=v%BASE
+      carry=math.floor((v-out[idx]) / BASE)
+    end
+    out[i+#b]=out[i+#b]+carry
+  end
+  return trim(out)
+end
+
+local function bigint_mul_small(a, m)
+  local out = {}
+  local carry=0
+  for i=1,#a do
+    local v=a[i]*m + carry
+    out[i]=v%BASE
+    carry=math.floor((v-out[i]) / BASE)
+  end
+  while carry>0 do
+    out[#out+1]=carry%BASE
+    carry=math.floor((carry-out[#out]) / BASE)
+  end
+  return trim(out)
+end
+
+local function bigint_shr(a, bits)
+  local bytes = math.floor(bits / 16)
+  local shift = bits % 16
+  if bytes >= #a then return {} end
+  local out = {}
+  local carry=0
+  for i=#a,bytes+1,-1 do
+    local v=a[i]
+    out[i-bytes]=(v>>shift) | (carry<< (16-shift))
+    carry=v & ((1<<shift)-1)
+  end
+  return trim(out)
+end
+
+local function bigint_mask(a, bits)
+  local out = {}
+  local full = math.floor(bits / 16)
+  local part = bits % 16
+  for i=1,full do out[i]=a[i] or 0 end
+  if part>0 then
+    out[full+1]=(a[full+1] or 0) & ((1<<part)-1)
+  end
+  return trim(out)
+end
+
+local P = {65531,65535,65535,65535,65535,65535,65535,65535,3}
+
+local function mod_p(n)
+  while bigint_bitlen(n) > 130 do
+    local hi = bigint_shr(n,130)
+    local lo = bigint_mask(n,130)
+    n = bigint_add(lo, bigint_mul_small(hi,5))
+  end
+  if bigint_cmp(n,P) >= 0 then
+    n = bigint_sub(n,P)
+  end
+  return n
+end
+
+local function process_block(ctx, block)
+  local bytes = {}
+  for i=0,#block-1 do bytes[#bytes+1]=block:get(i) end
+  bytes[#bytes+1]=1
+  local n = bytes_to_bigint(bytes)
+  ctx.acc = mod_p(bigint_mul(bigint_add(ctx.acc,n), ctx.r))
+end
+
+
+local function update(ctx,data)
+  local m=to_userdata(data)
+  local idx=0
+  local len=#m
+  if ctx.buffer_len>0 then
+    local need=16-ctx.buffer_len
+    local to_copy=math.min(need,len)
+    ctx.buffer:set(ctx.buffer_len,m:get(0,to_copy))
+    ctx.buffer_len=ctx.buffer_len+to_copy
+    idx=idx+to_copy
+    len=len-to_copy
+    if ctx.buffer_len==16 then
+      process_block(ctx, ctx.buffer)
+      ctx.buffer_len=0
+    end
+  end
+  while len>=16 do
+    local chunk=userdata("u8",16)
+    chunk:set(0,m:get(idx,16))
+    process_block(ctx,chunk)
+    idx=idx+16
+    len=len-16
+  end
+  if len>0 then
+    ctx.buffer:set(0,m:get(idx,len))
+    ctx.buffer_len=len
+  end
+end
+
+local function finish(ctx)
+  if ctx.buffer_len>0 then
+    local chunk=userdata("u8",ctx.buffer_len)
+    chunk:set(0,ctx.buffer:get(0,ctx.buffer_len))
+    process_block(ctx,chunk)
+    ctx.buffer_len=0
+  end
+  local acc_plus_s = bigint_add(ctx.acc, ctx.s)
+  local out_bytes = bigint_to_bytes(acc_plus_s,16)
+  local ud = userdata("u8",16)
+  ud:set(0,table.unpack(out_bytes))
+  return ud
+end
+
+function M.new(key)
+  local k = to_userdata(key)
+  assert(#k==32, "poly1305 key must be 32 bytes")
+  local r_bytes={}
+  local s_bytes={}
+  for i=0,15 do 
+    r_bytes[i+1]=k:get(i) 
+  end
+  for i=16,31 do 
+    s_bytes[#s_bytes+1]=k:get(i) 
+  end
+  r_bytes[4]=r_bytes[4] & 0x0f
+  r_bytes[5]=r_bytes[5] & 0xfc
+  r_bytes[8]=r_bytes[8] & 0x0f
+  r_bytes[9]=r_bytes[9] & 0xfc
+  r_bytes[12]=r_bytes[12] & 0x0f
+  r_bytes[13]=r_bytes[13] & 0xfc
+  r_bytes[16]=r_bytes[16] & 0x0f
+  local ctx={
+    r=bytes_to_bigint(r_bytes),
+    s=bytes_to_bigint(s_bytes),
+    acc={},
+    buffer=userdata("u8",16),
+    buffer_len=0,
+  }
+  function ctx:update(data)
+    update(ctx,data)
+  end
+
+  function ctx:tag()
+    local ud = finish(ctx)
+    return chr(ud:get(0,16))
+  end
+
+  function ctx:utag()
+    return finish(ctx)
+  end
+  return ctx
+end
+
+return M
+
+:: crypto/record.lua
+--[[pod_format="raw",created="2025-07-27 10:10:10",modified="2025-07-27 10:10:10",revision=0]]
+local M = {}
+
+M.NONCE_SIZE = 12
+M.TAG_SIZE = aead.TAG_SIZE
+M.MAX_PLAINTEXT = 16384
+
+local function to_udata(data)
+  if type(data) == "string" then
+    local u = userdata("u8", #data)
+    if #data > 0 then
+      u:set(0, ord(data, 1, #data))
+    end
+    return u
+  elseif type(data) == "userdata" then
+    data:mutate("u8", #data)
+    return data
+  else
+    error("[record]: expected string or userdata")
+  end
+end
+
+local function tohex(buf)
+  local t = {}
+  if type(buf) == "userdata" then
+    for i=0,#buf-1 do
+      t[#t+1] = string.format("%02x", buf:get(i))
+    end
+  else
+    for i=1,#buf do
+      t[#t+1] = string.format("%02x", ord(buf,i))
+    end
+  end
+  return table.concat(t, "")
+end
+
+local function build_nonce(iv, seq)
+  local nonce = userdata("u8", #iv)
+  nonce:set(0, iv:get())
+  for i=0,7 do
+    local idx = #nonce - 1 - i
+    nonce:set(idx, nonce:get(idx) ~ (seq & 0xff))
+    seq = seq >> 8
+  end
+  return nonce
+end
+
+function M.new(key, iv)
+  local k = to_udata(key)
+  local v = to_udata(iv)
+  assert(#k == 32, "key must be 32 bytes")
+  assert(#v == M.NONCE_SIZE, "iv must be 12 bytes")
+  local ctx = {
+    key = chr(k:get()),
+    iv = v,
+    seq = 0,
+  }
+  return setmetatable(ctx, {__index = M})
+end
+
+function M:next_nonce()
+  local n = build_nonce(self.iv, self.seq)
+  self.seq = (self.seq + 1) & 0xffffffffffffffff
+  return n
+end
+
+function M:seal(type_id, data)
+  local pt = to_udata(data)
+  assert(#pt <= M.MAX_PLAINTEXT, "record too large")
+
+  local inner = userdata("u8", #pt + 1)
+  inner:set(0, pt:get())
+  inner:set(#pt, type_id)
+
+  local aad = userdata("u8", 5)
+  local len = #inner + M.TAG_SIZE
+  aad:set(0, constants.content_type.application_data, 0x03, 0x03, (len>>8)&0xff, len&0xff)
+
+  local nonce = self:next_nonce()
+  local ct, tag = aead.seal(self.key, nonce, chr(inner:get()), chr(aad:get()))
+  local out = chr(aad:get()) .. ct .. tag
+  return out
+end
+
+local function strip_padding(buf)
+  while #buf > 0 do
+    local b = ord(buf, #buf)
+    if b == 0 then
+      buf = buf:sub(1, #buf-1)
+    else
+      break
+    end
+  end
+  return buf
+end
+
+function M:open(record)
+  assert(#record >= 5 + M.TAG_SIZE, "record too short")
+  local len
+  local aad
+  local body
+  if type(record) == "string" then
+    len = (ord(record,4) << 8) | ord(record,5)
+    aad = record:sub(1,5)
+    body = record:sub(6)
+  else
+    len = (record:get(3) << 8) | record:get(4)
+    aad = chr(record:get(0,5))
+    body = chr(record:get(5, #record - 5))
+  end
+  assert(#record == 5 + len, "length mismatch")
+  local ct = body:sub(1, #body - M.TAG_SIZE)
+  local tag = body:sub(#body - M.TAG_SIZE + 1)
+
+  local nonce = build_nonce(self.iv, self.seq)
+  self.seq = (self.seq + 1) & 0xffffffffffffffff
+
+  local pt, err = aead.open(self.key, nonce, ct, aad, tag)
+  if not pt then
+    printh("[record.open] decrypt failed: "..tostring(err))
+    return nil, err
+  end
+
+  pt = strip_padding(pt)
+  local t = ord(pt, #pt)
+  local data = pt:sub(1, #pt - 1)
+  return data, t
+end
+
+return M
+
+:: crypto/record_utils.lua
+--[[pod_format="raw",created="2025-07-27 10:10:10",modified="2025-07-27 10:10:10",revision=0]]
+local M = {}
+
+local function to_udata(data)
+  if type(data) == "string" then
+    local u = userdata("u8", #data)
+    if #data > 0 then
+      u:set(0, ord(data, 1, #data))
+    end
+    return u
+  elseif type(data) == "userdata" then
+    data:mutate("u8", #data)
+    return data
+  else
+    error("[record_utils]: expected string or userdata")
+  end
+end
+
+local function tohex(buf)
+  local t = {}
+  if type(buf) == "userdata" then
+    for i=0,#buf-1 do
+      t[#t+1] = string.format("%02x", buf:get(i))
+    end
+  else
+    for i=1,#buf do
+      t[#t+1] = string.format("%02x", ord(buf,i))
+    end
+  end
+  return table.concat(t, "")
+end
+
+local function u16(n)
+  return chr((n >> 8) & 0xff, n & 0xff)
+end
+
+function M.client_hello_record(hs, host)
+  if not hs or type(hs.client_hello) ~= "function" then
+    error("[record_utils.client_hello_record]: invalid handshake object")
+  end
+  local msg = to_udata(hs:client_hello(host))
+  local rec = {
+    type = constants.content_type.handshake,
+    version = constants.version.TLS1_0,
+    length = #msg,
+    body = msg,
+  }
+  local bytes = userdata("u8", 5 + #msg)
+  bytes:set(0,
+    rec.type,
+    (rec.version >> 8) & 0xff,
+    rec.version & 0xff,
+    (rec.length >> 8) & 0xff,
+    rec.length & 0xff)
+  bytes:set(5, msg:get(0, #msg))
+  rec.bytes = bytes
+  return rec
+end
+
+function M.parse_records(data)
+  local buf = to_udata(data)
+  local records = {}
+  local pos = 0
+  local idx = 1
+  while pos + 5 <= #buf do
+    local typ = buf:get(pos)
+    local ver = (buf:get(pos + 1) << 8) | buf:get(pos + 2)
+    local len = (buf:get(pos + 3) << 8) | buf:get(pos + 4)
+    if pos + 5 + len > #buf then break end
+    local body = userdata("u8", len)
+    body:set(0, buf:get(pos + 5, len))
+    local bytes = userdata("u8", 5 + len)
+    bytes:set(0, buf:get(pos, 5 + len))
+    records[#records + 1] = {
+      type = typ,
+      version = ver,
+      length = len,
+      body = body,
+      bytes = bytes,
+    }
+    pos = pos + 5 + len
+    idx = idx + 1
+  end
+  return records
+end
+
+return M
+
+:: crypto/rng.lua
+--[[pod_format="raw",created="2025-07-27 10:10:10",modified="2025-07-27 10:10:10",revision=0]]
+local M = {}
+
+local state = userdata("i32", 4)
+local pool = userdata("u8", 0x400)
+local pool_pos = 0x400
+local cache = 0
+local cache_left = 0
+
+local function rotl32(x, n)
+  x = x & 0xffffffff
+  return ((x << n) | (x >> (32 - n))) & 0xffffffff
+end
+
+local function xoshiro_next()
+  local s0 = state[0]
+  local s1 = state[1]
+  local s2 = state[2]
+  local s3 = state[3]
+
+  local result = rotl32((s1 * 5) & 0xffffffff, 7)
+  result = (result * 9) & 0xffffffff
+
+  local t = (s1 << 9) & 0xffffffff
+  s2 = s2 ~ s0
+  s3 = s3 ~ s1
+  s1 = s1 ~ s2
+  s0 = s0 ~ s3
+  s2 = s2 ~ t
+  s3 = rotl32(s3, 11)
+
+  state[0] = s0
+  state[1] = s1
+  state[2] = s2
+  state[3] = s3
+
+  return result
+end
+
+local function reseed()
+  local start = flr(rnd(63))
+  pool:peek(0xf78000 + (0x400 * start), 0, 0x400)
+  local idx = 0
+  for i=0,3 do
+    local b0 = pool:get(idx)
+    local b1 = pool:get(idx+1)
+    local b2 = pool:get(idx+2)
+    local b3 = pool:get(idx+3)
+    state[i] = ((b0<<24)|(b1<<16)|(b2<<8)|b3) & 0xffffffff
+    idx = idx + 4
+  end
+  pool_pos = idx
+  cache = 0
+  cache_left = 0
+end
+
+reseed()
+
+local function next_byte()
+  if pool_pos < 0x400 then
+    local b = pool:get(pool_pos)
+    pool_pos = pool_pos + 1
+    return b
+  end
+  if cache_left == 0 then
+    cache = xoshiro_next()
+    cache_left = 4
+  end
+  cache_left = cache_left - 1
+  return (cache >> (cache_left*8)) & 0xff
+end
+
+function M.reseed()
+  reseed()
+end
+
+function M.u8()
+  return next_byte()
+end
+
+function M.u32()
+  local b0 = next_byte()
+  local b1 = next_byte()
+  local b2 = next_byte()
+  local b3 = next_byte()
+  return ((b0<<24)|(b1<<16)|(b2<<8)|b3) & 0xffffffff
+end
+
+function M.udata(n)
+  local ud = userdata("u8", n)
+  for i=0,n-1 do
+    ud:set(i, next_byte())
+  end
+  return ud
+end
+
+function M.bytes(n)
+  local ud = M.udata(n)
+  return chr(ud:get())
+end
+
+return M
+
+
+:: crypto/sha256.lua
+--[[pod_format="raw",created="2025-07-27 10:10:10",modified="2025-07-27 10:10:10",revision=0]]
+local M = {}
+M.DIGEST_SIZE = 32
+M.BLOCK_SIZE  = 64
+
+local function to_userdata(data)
+  if type(data) == "string" then
+    local u = userdata("u8", #data)
+    if #data > 0 then
+      u:set(0, ord(data, 1, #data))
+    end
+    return u
+  elseif type(data) == "userdata" then
+    data:mutate("u8", #data)
+    return data
+  else
+    error("[sha256]: expected string or userdata")
+  end
+end
+
+local function rightrotate(x, c)
+  x = x & 0xffffffff
+  return ((x >> c) | ((x << (32 - c)) & 0xffffffff)) & 0xffffffff
+end
+
+local K_bytes = {
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,
+  0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,
+  0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,
+  0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,
+  0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,
+  0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,
+  0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,
+  0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,
+  0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+}
+local K = userdata("i32", 64)
+K:set(0, table.unpack(K_bytes))
+
+local mask = userdata("i32", 8)
+mask:set(0,
+  0xffffffff,0xffffffff,0xffffffff,0xffffffff,
+  0xffffffff,0xffffffff,0xffffffff,0xffffffff)
+
+local function process_chunk(state, chunk, w, tmp_state)
+  for i = 0,15 do
+    local b0,b1,b2,b3 = chunk:get(i*4), chunk:get(i*4+1), chunk:get(i*4+2), chunk:get(i*4+3)
+    w:set(i, ((b0<<24)|(b1<<16)|(b2<<8)|b3) & 0xffffffff)
+  end
+  for i = 16,63 do
+    local v15 = w:get(i-15) & 0xffffffff
+    local v2 = w:get(i-2) & 0xffffffff
+    local s0 = rightrotate(v15,7) ~ rightrotate(v15,18) ~ (v15 >> 3)
+    local s1 = rightrotate(v2,17) ~ rightrotate(v2,19) ~ (v2 >> 10)
+    local val = (w:get(i-16) + s0 + w:get(i-7) + s1) & 0xffffffff
+    w:set(i,val)
+  end
+  local a,b,c,d,e,f,g,h = state:get(0,8)
+  for i=0,63 do
+    local S1 = rightrotate(e,6) ~ rightrotate(e,11) ~ rightrotate(e,25)
+    local ch = (e & f) ~ (~e & g)
+    local temp1 = (h + S1 + ch + K:get(i) + w:get(i)) & 0xffffffff
+    local S0 = rightrotate(a,2) ~ rightrotate(a,13) ~ rightrotate(a,22)
+    local maj = (a & b) ~ (a & c) ~ (b & c)
+    local temp2 = (S0 + maj) & 0xffffffff
+    h = g
+    g = f
+    f = e
+    e = (d + temp1) & 0xffffffff
+    d = c
+    c = b
+    b = a
+    a = (temp1 + temp2) & 0xffffffff
+  end
+  tmp_state:set(0,a,b,c,d,e,f,g,h)
+  state:add(tmp_state,true)
+  state:band(mask,true)
+end
+
+local function init_ctx(ctx)
+  ctx.state:set(0,
+    0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+    0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19)
+  ctx.buffer_len = 0
+  ctx.len = 0
+  ctx._digest = nil
+end
+
+local function new_ctx()
+  local ctx = {
+    state = userdata("i32",8),
+    buffer = userdata("u8",64),
+    buffer_len = 0,
+    len = 0,
+    w = userdata("i32",64),
+    tmp_state = userdata("i32",8),
+    _digest=nil,
+  }
+  init_ctx(ctx)
+  return ctx
+end
+
+local function clone_ctx(src)
+  local dst = new_ctx()
+  dst.state:set(0, src.state:get(0,8))
+  if src.buffer_len > 0 then
+    dst.buffer:set(0, src.buffer:get(0, src.buffer_len))
+  end
+  dst.buffer_len = src.buffer_len
+  dst.len        = src.len
+  return dst
+end
+
+
+local function update(ctx,chunk)
+  local msg = to_userdata(chunk)
+  local len = #chunk
+  ctx.len = ctx.len + len
+  ctx._digest = nil
+  local offset = 0
+  if ctx.buffer_len > 0 then
+    local need = 64 - ctx.buffer_len
+    if len >= need then
+      ctx.buffer:set(ctx.buffer_len, msg:get(0,need))
+      process_chunk(ctx.state, ctx.buffer, ctx.w, ctx.tmp_state)
+      ctx.buffer_len = 0
+      offset = need
+    else
+      ctx.buffer:set(ctx.buffer_len, msg:get(0,len))
+      ctx.buffer_len = ctx.buffer_len + len
+      return
+    end
+  end
+  while len - offset >= 64 do
+    ctx.buffer:set(0, msg:get(offset,64))
+    process_chunk(ctx.state, ctx.buffer, ctx.w, ctx.tmp_state)
+    offset = offset + 64
+  end
+  if len - offset > 0 then
+    ctx.buffer:set(0, msg:get(offset, len - offset))
+    ctx.buffer_len = len - offset
+  end
+end
+
+local function finish(ctx)
+  if ctx._digest then return ctx._digest end
+
+  local bit_len = ctx.len * 8
+  local pad = ((56 - (ctx.len + 1) % 64) % 64)
+  local total = ctx.buffer_len + 1 + pad + 8
+  local buf = userdata("u8", total)
+  if ctx.buffer_len > 0 then
+    buf:set(0, ctx.buffer:get(0, ctx.buffer_len))
+  end
+  buf:set(ctx.buffer_len,0x80)
+  for i=1,pad do buf:set(ctx.buffer_len+i,0) end
+  for i=0,7 do
+    buf:set(total-1-i, (bit_len>>(8*i)) & 0xff)
+  end
+  local offset=0
+  while offset < total do
+    ctx.buffer:set(0, buf:get(offset,64))
+    process_chunk(ctx.state, ctx.buffer, ctx.w, ctx.tmp_state)
+    offset = offset + 64
+  end
+  local out = userdata("u8",32)
+  local parts={ctx.state:get(0,8)}
+  for i=0,7 do
+    local v = parts[i+1]
+    out:set(i*4, (v>>24)&0xff, (v>>16)&0xff, (v>>8)&0xff, v & 0xff)
+  end
+  ctx._digest = out
+  return out
+end
+
+function M.new(data)
+  local ctx = new_ctx()
+
+  function ctx:update(chunk)
+    update(ctx, chunk)
+  end
+
+  function ctx:clone()
+    return clone_ctx(ctx)
+  end
+
+  function ctx:reset()
+    init_ctx(ctx)
+  end
+
+  function ctx:udigest()
+    if not ctx._digest then
+      local tmp = clone_ctx(ctx)
+      ctx._digest = finish(tmp)
+    end
+    return ctx._digest
+  end
+
+  function ctx:sdigest()
+    local ud = ctx:udigest()
+    return chr(ud:get())
+  end
+
+  function ctx:hexdigest()
+    local ud = ctx:udigest()
+    local t={}
+    for i=0,#ud-1 do
+      local byte = ud:get(i)
+      t[#t+1]=string.format("%02x",byte)
+    end
+    return table.concat(t,"")
+  end
+
+  if data then
+    ctx:update(data)
+  end
+
+  return ctx
+end
+
+
+return M
+
+:: crypto/tls_socket.lua
+--[[pod_format="raw",created="2025-07-27 10:10:10",modified="2025-07-27 10:10:10",revision=0]]
+local M = {}
+
+local function to_udata(data)
+  if type(data) == "string" then
+    local u = userdata("u8", #data)
+    if #data > 0 then u:set(0, ord(data, 1, #data)) end
+    return u
+  elseif type(data) == "userdata" then
+    data:mutate("u8", #data)
+    return data
+  else
+    error("[tls_socket]: expected string or userdata")
+  end
+end
+
+local function u24(n)
+  return chr((n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff)
+end
+
+local function tohex(buf)
+  local t = {}
+  if type(buf) == "userdata" then
+    for i=0,#buf-1 do
+      t[#t+1] = string.format("%02x", buf:get(i))
+    end
+  else
+    for i=1,#buf do
+      t[#t+1] = string.format("%02x", ord(buf,i))
+    end
+  end
+  return table.concat(t, "")
+end
+
+local function parse_records(buf)
+  buf = to_udata(buf)
+  local records = {}
+  local pos = 0
+  while pos + 5 <= #buf do
+    local typ = buf:get(pos)
+    local ver = (buf:get(pos + 1) << 8) | buf:get(pos + 2)
+    local len = (buf:get(pos + 3) << 8) | buf:get(pos + 4)
+    if pos + 5 + len > #buf then break end
+    local body = userdata("u8", len)
+    body:set(0, buf:get(pos + 5, len))
+    local bytes = userdata("u8", 5 + len)
+    bytes:set(0, buf:get(pos, 5 + len))
+    records[#records+1] = {type=typ, version=ver, length=len, body=body, bytes=bytes}
+    pos = pos + 5 + len
+  end
+  local leftover = ""
+  if pos < #buf then
+    local tmp = userdata("u8", #buf - pos)
+    tmp:set(0, buf:get(pos, #buf - pos))
+    leftover = chr(tmp:get())
+  end
+  return records, leftover
+end
+
+local Conn = {}
+Conn.__index = Conn
+
+function Conn:write(data)
+  local dtype = type(data)
+  local dlen = dtype == "string" and #data or #data
+  local rec = self._enc:seal(constants.content_type.application_data, data)
+  self._sock:write(rec)
+end
+
+function Conn:status()
+  return self._sock:status()
+end
+
+function Conn:_pull()
+  local chunk
+  while self._sock:status() == 'ready' and not chunk do
+    chunk = self._sock:read()
+  end
+  if not chunk then return end
+  self._rbuf = self._rbuf .. chunk
+  while true do
+    chunk = self._sock:read()
+    if not chunk then break end
+    self._rbuf = self._rbuf .. chunk
+  end
+end
+
+function Conn:read()
+  if #self._rbuf == 0 and self._sock:status() == 'ready' then
+    self:_pull()
+  end
+  local out = ""
+  repeat
+    local records, rest = parse_records(self._rbuf)
+    self._rbuf = rest
+    for _,r in ipairs(records) do
+      if r.type == constants.content_type.application_data then
+        local pt, typ = self._dec:open(r.bytes)
+        if pt then
+          if typ == constants.content_type.application_data then
+            out = out .. pt
+          elseif typ == constants.content_type.handshake then
+            local htype = ord(pt,1)
+            if htype == constants.handshake_type.new_session_ticket then
+            end
+          end
+        end
+      end
+    end
+    if #out > 0 then break end
+    if self._sock:status() ~= 'ready' then break end
+    self:_pull()
+  until #out > 0 or #self._rbuf == 0
+  if #out > 0 then
+    --printh(string.format("[tls_socket.read] out len=%d", #out))
+    return out
+  else
+    -- printh("[tls_socket.read] out nil")
+    return nil
+  end
+end
+
+function Conn:close()
+  local alert = chr(constants.alert_level.warning,
+                    constants.alert_description.close_notify)
+  local rec = self._enc:seal(constants.content_type.alert, alert)
+  self._sock:write(rec)
+  self._sock:close()
+end
+
+function M.connect(host, port)
+  local sock, err = socket("tcp://"..host..":"..port)
+  if not sock then error("[tls_socket.connect]: "..tostring(err)) end
+  --printh("[tls_socket] connected tcp://"..host..":"..port)
+  local hs = handshake.new{    
+    --client_random = userdata("u8",32,"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+    --private_key =   userdata("u8",32,"e81ea2b8c3c140f47cc67dfb20aeeb77e4db7ab5a6d1f605006ebe35a4768846"),
+    compatibility_mode = false
+  }
+
+  local rec = record_utils.client_hello_record(hs, nil)
+  local ch = rec.body
+  local ud = rec.bytes
+
+  if #ud >= 5 then
+    local rtype = ud:get(0)
+    local ver = (ud:get(1) << 8) | ud:get(2)
+    local len = (ud:get(3) << 8) | ud:get(4)
+    if rtype == constants.content_type.handshake and #ud >= 5 + len then
+      local hs_type = ud:get(5)
+    end
+  end
+  sock:write(chr(ud:get()))
+
+  local rbuf = ""
+  local records, rest
+
+  repeat
+    local chunk
+    while sock:status() == 'ready' and not chunk do
+      chunk = sock:read()
+    end
+    if not chunk then error("no server hello") end
+    rbuf = rbuf .. chunk
+    records, rest = parse_records(rbuf)
+  until #records > 0
+  rbuf = rest
+
+  local schedule = hs:process_server_hello(records[1].bytes)
+
+  ---------------------------------------------------------
+  local hs_transcript = hs.transcript:sdigest()
+  --printh("REAL HS_TRANSCRIPT: " .. tohex(hs_transcript))
+  ---------------------------------------------------------
+  local enc = record.new(schedule.client_hs_key, schedule.client_hs_iv)
+  local dec = record.new(schedule.server_hs_key, schedule.server_hs_iv)
+
+
+  local rec_list = {}
+  for i=2,#records do rec_list[#rec_list+1] = records[i] end
+
+  local leftover = ""
+  local server_finished
+  local idx = 1
+  while not server_finished do
+    if idx > #rec_list then
+      local chunk
+      while sock:status() == 'ready' and not chunk do
+        chunk = sock:read()
+      end
+      if not chunk then break end
+      rbuf = rbuf .. chunk
+      local more; more, rbuf = parse_records(rbuf)
+      for _,v in ipairs(more) do rec_list[#rec_list+1] = v end
+    end
+    local r = rec_list[idx]; idx = idx + 1
+    if not r then break end
+    if r.type == constants.content_type.application_data then
+      local pt, typ = dec:open(r.bytes)
+      if pt and typ == constants.content_type.handshake then
+        leftover = leftover .. pt
+        while #leftover >= 4 do
+          local len = (ord(leftover,2) << 16) | (ord(leftover,3) << 8) | ord(leftover,4)
+          if #leftover < 4 + len then break end
+          local msg = leftover:sub(1, 4 + len)
+          local mtype = ord(leftover,1)
+          if mtype == constants.handshake_type.finished then
+            server_finished = msg
+            leftover = leftover:sub(4 + len + 1)
+            break
+          else
+            hs.transcript:update(msg)
+            leftover = leftover:sub(4 + len + 1)
+          end
+        end
+      end
+    end
+  end
+
+  if not server_finished then error("server finished missing") end
+
+  hs.transcript:update(server_finished)
+
+-------------------------------------------------------------------
+   local full_transcript = hs.transcript:sdigest()
+   --printh("REAL FULL_TRANSCRIPT: " .. tohex(full_transcript))
+-------------------------------------------------------------------
+
+  leftover = ""
+
+  if idx <= #rec_list then
+    local remain = {}
+    for i=idx,#rec_list do
+      remain[#remain+1] = chr(rec_list[i].bytes:get())
+    end
+    rbuf = table.concat(remain) .. rbuf
+  end
+
+  schedule:derive_application(full_transcript)
+
+  local verify = key_schedule.verify_data(schedule.client_hs_secret, full_transcript)
+  local fin = chr(constants.handshake_type.finished) .. u24(#verify) .. verify
+  hs.transcript:update(fin)
+  local fin_record = enc:seal(constants.content_type.handshake, fin)
+  sock:write(fin_record)
+  local crandom = tohex(hs.client_random)
+  local conn = setmetatable({
+    _sock = sock,
+    _enc = record.new(schedule.client_app_key, schedule.client_app_iv),
+    _dec = record.new(schedule.server_app_key, schedule.server_app_iv),
+    _rbuf = rbuf,
+  }, Conn)
+  return conn
+end
+
+return M
+
+:: crypto/x25519.lua
+--[[pod_format="raw",created="2025-07-27 10:10:10",modified="2025-07-27 10:10:10",revision=0]]
+local M = {}
+
+local BASE = 0x10000
+
+local function trim(a)
+  for i=#a,1,-1 do
+    if a[i] ~= 0 then return a end
+    a[i] = nil
+  end
+  return a
+end
+
+local function bytes_to_bigint(bytes)
+  local out = {}
+  local j = 1
+  for i=1,#bytes,2 do
+    local lo = bytes[i]
+    local hi = bytes[i+1] or 0
+    out[j] = lo | (hi << 8)
+    j = j + 1
+  end
+  return trim(out)
+end
+
+local function bigint_to_bytes(bn, len)
+  local out = {}
+  local j = 1
+  for i=1,math.floor(len/2) do
+    local v = bn[i] or 0
+    out[j] = v & 0xff
+    out[j+1] = (v >> 8) & 0xff
+    j = j + 2
+  end
+  if len % 2 == 1 then
+    out[j] = (bn[math.floor(len/2)+1] or 0) & 0xff
+  end
+  return out
+end
+
+local function bigint_bitlen(a)
+  if #a == 0 then return 0 end
+  local top = a[#a]
+  local bits = (#a - 1) * 16
+  while top > 0 do
+    bits = bits + 1
+    top = top >> 1
+  end
+  return bits
+end
+
+local function bigint_add(a,b)
+  local out = {}
+  local carry = 0
+  local len = math.max(#a,#b)
+  for i=1,len do
+    local v = (a[i] or 0) + (b[i] or 0) + carry
+    out[i] = v % BASE
+    carry = math.floor((v - out[i]) / BASE)
+  end
+  if carry > 0 then out[len+1] = carry end
+  return trim(out)
+end
+
+local function bigint_add_small(a,s)
+  local out = {}
+  local carry = s
+  local i = 1
+  while carry > 0 or i <= #a do
+    local v = (a[i] or 0) + carry
+    out[i] = v % BASE
+    carry = math.floor((v - out[i]) / BASE)
+    i = i + 1
+  end
+  return trim(out)
+end
+
+local function bigint_sub(a,b)
+  local out = {}
+  local borrow = 0
+  for i=1,#a do
+    local v = (a[i] or 0) - (b[i] or 0) - borrow
+    if v < 0 then
+      v = v + BASE
+      borrow = 1
+    else
+      borrow = 0
+    end
+    out[i] = v
+  end
+  return trim(out)
+end
+
+local function bigint_cmp(a,b)
+  if #a > #b then return 1 end
+  if #a < #b then return -1 end
+  for i=#a,1,-1 do
+    local ai, bi = a[i] or 0, b[i] or 0
+    if ai > bi then return 1 end
+    if ai < bi then return -1 end
+  end
+  return 0
+end
+
+local function bigint_mul(a,b)
+  local out = {}
+  for i=1,#a+#b do out[i]=0 end
+  for i=1,#a do
+    local carry=0
+    for j=1,#b do
+      local idx=i+j-1
+      local v=out[idx] + a[i]*b[j] + carry
+      out[idx]=v%BASE
+      carry=math.floor((v-out[idx]) / BASE)
+    end
+    out[i+#b]=out[i+#b]+carry
+  end
+  return trim(out)
+end
+
+local function bigint_mul_small(a,m)
+  local out = {}
+  local carry=0
+  for i=1,#a do
+    local v=a[i]*m + carry
+    out[i]=v%BASE
+    carry=math.floor((v-out[i]) / BASE)
+  end
+  while carry>0 do
+    out[#out+1]=carry%BASE
+    carry=math.floor((carry-out[#out]) / BASE)
+  end
+  return trim(out)
+end
+
+local function bigint_shr(a,bits)
+  local bytes=math.floor(bits / 16)
+  local shift=bits%16
+  if bytes >= #a then return {} end
+  local out={}
+  local carry=0
+  for i=#a,bytes+1,-1 do
+    local v=a[i]
+    out[i-bytes]=(v>>shift) | (carry<< (16-shift))
+    carry=v & ((1<<shift)-1)
+  end
+  return trim(out)
+end
+
+local function bigint_mask(a,bits)
+  local out={}
+  local full=math.floor(bits / 16)
+  local part=bits%16
+  for i=1,full do out[i]=a[i] or 0 end
+  if part>0 then out[full+1]=(a[full+1] or 0) & ((1<<part)-1) end
+  return trim(out)
+end
+
+local P = { }
+P[16] = 0x7fff
+P[15] = 0xffff
+P[14] = 0xffff
+P[13] = 0xffff
+P[12] = 0xffff
+P[11] = 0xffff
+P[10] = 0xffff
+P[9]  = 0xffff
+P[8]  = 0xffff
+P[7]  = 0xffff
+P[6]  = 0xffff
+P[5]  = 0xffff
+P[4]  = 0xffff
+P[3]  = 0xffff
+P[2]  = 0xffff
+P[1]  = 0xffed
+P = trim(P)
+
+local function copy(a)
+  local out={}
+  for i=1,#a do out[i]=a[i] end
+  return out
+end
+
+local function mod_p(n)
+  while bigint_bitlen(n) > 255 do
+    local hi = bigint_shr(n,255)
+    local lo = bigint_mask(n,255)
+    n = bigint_add(lo, bigint_mul_small(hi,19))
+  end
+  if bigint_cmp(n,P) >= 0 then
+    n = bigint_sub(n,P)
+  end
+  return trim(n)
+end
+
+local function fe_add(a,b)
+  return mod_p(bigint_add(a,b))
+end
+
+local function fe_sub(a,b)
+  return mod_p(bigint_sub(bigint_add(a,P), b))
+end
+
+local function fe_mul(a,b)
+  return mod_p(bigint_mul(a,b))
+end
+
+local function fe_mul_small(a,m)
+  return mod_p(bigint_mul_small(a,m))
+end
+
+local P_MINUS_2 = bigint_sub(copy(P), {2})
+
+local function bigint_is_zero(a)
+  return #a==0 or (#a==1 and a[1]==0)
+end
+
+local function pow_pminus2(x)
+  local result = {1}
+  local base = copy(x)
+  local e = copy(P_MINUS_2)
+  while not bigint_is_zero(e) do
+    if (e[1] & 1) == 1 then
+      result = fe_mul(result, base)
+    end
+    e = bigint_shr(e,1)
+    base = fe_mul(base, base)
+  end
+  return result
+end
+
+local function decode_u8_le(str)
+  local t={}
+  for i=1,#str do t[i]=ord(str,i) end
+  return bytes_to_bigint(t)
+end
+
+local function clamp_scalar(str)
+  local t={}
+  for i=1,#str do t[i]=ord(str,i) end
+  t[1] = t[1] & 248
+  t[32] = (t[32] & 127) | 64
+  return t, bytes_to_bigint(t)
+end
+
+local function encode_bigint(bn)
+  local bytes = bigint_to_bytes(bn,32)
+  local t={}
+  for i=1,32 do t[i]=chr(bytes[i]) end
+  return table.concat(t)
+end
+
+local function bit_from_bytes(bytes,idx)
+  local byte = bytes[math.floor(idx/8)+1]
+  local bit = idx%8
+  return (byte >> bit) & 1
+end
+
+local function cswap(swap,a,b)
+  if swap==0 then return a,b end
+  return b,a
+end
+
+local function curve25519(k_bytes,u)
+  local x1 = copy(u)
+  local x2 = {1}
+  local z2 = {0}
+  local x3 = copy(u)
+  local z3 = {1}
+  local swap = 0
+  for t=254,0,-1 do
+    local k_t = bit_from_bytes(k_bytes,t)
+    swap = swap ~ k_t
+    if swap == 1 then
+      x2,x3 = x3,x2
+      z2,z3 = z3,z2
+    end
+    swap = k_t
+
+    local A = fe_add(x2,z2)
+    local AA = fe_mul(A,A)
+    local B = fe_sub(x2,z2)
+    local BB = fe_mul(B,B)
+    local E = fe_sub(AA,BB)
+    local C = fe_add(x3,z3)
+    local D = fe_sub(x3,z3)
+    local DA = fe_mul(D,A)
+    local CB = fe_mul(C,B)
+    x3 = fe_mul(fe_add(DA,CB), fe_add(DA,CB))
+    z3 = fe_mul(x1, fe_mul(fe_sub(DA,CB), fe_sub(DA,CB)))
+    x2 = fe_mul(AA,BB)
+    z2 = fe_mul(E, fe_add(AA, fe_mul_small(E,121665)))
+  end
+  x2, x3 = cswap(swap, x2, x3)
+  z2, z3 = cswap(swap, z2, z3)
+  local out = fe_mul(x2, pow_pminus2(z2))
+  return out
+end
+
+function M.scalar_mult(scalar, point)
+  assert(#scalar==32 and #point==32, "invalid length")
+  local k_bytes, k = clamp_scalar(scalar)
+  local u = decode_u8_le(point)
+  local res = curve25519(k_bytes, u)
+  return encode_bigint(res)
+end
+
+function M.scalar_base_mult(scalar)
+  return M.scalar_mult(scalar, chr(9) .. string.rep('\0',31))
+end
+
+return M
+
+
+:: crypto/.info.pod
+b64$LS1bW3BvZCxjcmVhdGVkPSIyMDI1LTA3LTI3IDExOjAzOjA3Iixtb2RpZmllZD0iMjAyNS0w
+Ny0yNyAxMToyMDozMSJdXQ==
+
+:: main.lua
+--[[pod_format="raw",created="2025-07-27 10:10:10",modified="2025-07-27 10:10:10",revision=0]]
+include("./crypto/crypto.lua")
+print("._:Noctonic's PicoTLS v0.1:_.")
+
+print("Creating TLS Connection")
+local host = "noctonic.github.io"
+local conn = tls.connect(host, 443)
+
+print("Sending Request")
+local req = table.concat({
+  "GET /hello.txt HTTP/1.1\r\n",
+  "Host: "..host.."\r\n",
+  "Connection: close\r\n",
+  "\r\n",
+})
+
+conn:write(req)
+
+print("Reading Response")
+local resp = conn:read()
+
+local sep = "\r\n\r\n"
+local header_end = resp:find(sep, 1, true)
+local headers = resp:sub(1, header_end - 1)
+local body = resp:sub(header_end + #sep)
+
+--print("=== HEADERS ===")
+--print(headers)
+print("=== BODY ===")
+print(body)
+:: crypto/.info.pod
+b64$LS1bW3BvZCxjcmVhdGVkPSIyMDI1LTA3LTI3IDEwOjEwOjEwIixtb2RpZmllZD0iMjAyNS0w
+Ny0yNyAxMDoxMDoxMCJdXQ==
+:: gfx/
+:: gfx/.info.pod
+b64$LS1bW3BvZCxjcmVhdGVkPSIyMDI1LTA3LTI3IDEwOjEwOjEwIixtb2RpZmllZD0iMjAyNS0w
+Ny0yNyAxMDoxMDoxMCJdXQ==
+:: map/
+:: map/.info.pod
+b64$LS1bW3BvZCxjcmVhdGVkPSIyMDI1LTA3LTI3IDEwOjEwOjEwIixtb2RpZmllZD0iMjAyNS0w
+Ny0yNyAxMDoxMDoxMCJdXQ==
+:: sfx/
+:: sfx/.info.pod
+b64$LS1bW3BvZCxjcmVhdGVkPSIyMDI1LTA3LTI3IDEwOjEwOjEwIixtb2RpZmllZD0iMjAyNS0w
+Ny0yNyAxMDoxMDoxMCJdXQ==
+:: label.qoi
+b64$cW9pZgAAAeAAAAEOBAH9-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f3b-v-x6P4AAADAPzXKPzXMPzXHPzXKP8E1wT81yj-DNT81wz-ANcs-wDXG
+PzX9-f39-fk-wDU-Nco-NdY-Nco-NcA-Nc8-NcE-NcI-NcA-Nck-NcA-NcQ-wDX9-f39-fk-NT-A
+NcA-wDXBP8E1P8I1wD-ANcA-wTXAP8A1wT-BNcU-wTXEPzXAPzU-wDXBP8E1wD-ANcI-NcE-NcI-
+Ncc-NcA-NT81P8A1xT81-f39-f31PzXBPzXAPzU-NcA-NT81wz81wT81wD81PzXAPzXAPzXAPzXH
+PzXHP8E1wT81wD81wj81wD81wT81wT81wz-ANcU-NcA-NT-ANT81xT81wT81-f39-f31PzXAPzU-
+NcA-NT81wz81wT81wD81PzXAPzXAPzXAPzXIP8A1xT81wz81wD81wj81wD81wT81wT81xT81xD81
+wD81PzXAPzXFPzX9-f39-fU-NcE-NcA-NT81wD81PzXDPzXBPzXAPzU-NcA-NcA-NcA-Nco-NcQ-
+NcM-NcA-NcI-NcA-NcE-NcE-NcI-NcA-NcQ-NT81wD81wD81xT81wT81-f39-f3oPzXAP8I1xD81
+wD81wD-ANcE-wTXBP8A1wD-ANcA-NcA-NT-BNcA-wTXEP8E1xT81wj-BNcA-wTXAP8A1wj81wT-C
+NcA-wDXFP8A1wj-ANcE-NcE-wTXEP8I1wD81-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f393D-ANdA-NcI-Nc8-wzU-NcM-wDXGP8A12j81wj81-f39-f39xD81wD81zz811j81wT81
+wj81wD81xD81wD812T81-f39-f39yT81wj81P8A1wD-ANcE-wDXAP8I1P8A1wD-BNcE-wTXGPzXB
+PzXCPzXHPzXDP8A1wD-BNcA-wTXBP8A1wT-BNT-CNT-ANcE-wDXAP8E1-f39-f34PzXCP8A1wT81
+wD81wj81wD81wj81wD81wD81PzXAPzXGPzXBPzXDP8A1xT81wj81wD81PzXAPzU-NcA-NT81wD81
+PzXDPzXCPzXAPzXAPzU-NcA-Nf39-f399z81wj81wj-CNcA-wTXAPzXCPzXAPzXAPzU-NcA-NcY-
+NcE-NcU-NcQ-NcI-NcA-NT81wD81PzXAPzU-wjU-NcM-NcI-NcA-NcA-NT81wD81-f39-f33PzXA
+PzU-NcI-NcI-NcA-NcA-NcI-NcA-NcA-NcA-wTXGPzXBPzXCPzXAPzXEPzXAPzU-NcA-NT81wD81
+PzXAPzU-NcI-NcM-NcI-NcA-NcA-NT81wD81-f39-f34P8A1wD81wz-BNcA-wTXBP8A1P8E1PzXA
+PzXCPzXGPzXBP8I1wD-ANcY-wDXBP8A1wD81wD81PzXAPzXAP8E1wD-BNcE-wDU-wTXAP8A1wD81
+wD81-f39-f393D-ANf39-f39-f39-f39-f39-f39-f39-f39-f39-f39-dY-wDXNPzXAPzXPP8E1
+2j81-f39-f394z81wD81zD810j81wD812T81-f39-f394z81wz-ANcA-wTXBP8E1P8A1wD-BNcE-
+wTXEPzXAPzXAP8A1wT-BNT81wD81wD-ANcE-wTU-wjX9-f39-f3iP8A1wD81wD81PzXAPzU-NcA-
+NcA-NcA-NcA-NT81wD81xD-BNcA-NcA-NT81wD81PzXAPzU-NcA-NT81wz81-f39-f395j81P8I1
+PzXAPzU-NcA-NcA-NcA-NcA-NT81wD81xD81wD81P8I1PzXAPzU-NcA-NT-CNcA-wDXBPzX9-f39
+-f3jPzXAPzU-NcI-NcA-NT81wD81wD81wD81wD81wD-BNcQ-NcA-NT81wz-BNT81wD81PzXFPzXA
+PzX9-f39-f3kP8A1wT-BNT81wD81wD-BNT-BNT81wD81wj81xD81wD81wD-BNcI-NcA-wTXAP8E1
+P8E1wj-ANf39-f39-f3BP8A10j81-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39xT-BNc0-
+NcA-Nc8-wTX9-f39-f39wj81wD81zD810j81wD81-f39-f39-cE-NcA-NcA-wDXBP8A1wT-BNT-A
+NcA-wTXBP8E1xD81wD81wD-ANcE-wTU-wTXBP8A1wD-BNcE-wTXAP8A1-f39-f393T-BNcA-NcA-
+NcI-NT81wD81wD81wD81wD81PzXAPzXEP8E1wD81wD81PzXCPzXAPzU-NcA-NT81wD81PzXCPzXA
+PzX9-f39-f3cPzXAPzU-wjXAP8E1PzXAPzXAPzXAPzXAPzU-NcA-NcQ-NcA-NT-CNcA-wDXAPzXA
+PzU-NcA-NT81wD81wD-ANcA-wjX9-f39-f3cPzXAPzU-NcI-NcA-NT81wD81wD81wD81wD81wD-B
+NcQ-NcA-NT81xT81P8E1wD81wD81PzXAPzXCPzU-Nf39-f39-d8-NcA-NcA-wTXAP8E1wD-BNT-B
+NT81wD81wj81xD81wD81wD-BNT-BNcA-NcM-wDXAPzXAPzU-wTXBP8E1-f39-f39_j-ANdQ-Nf39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-dc-wTXBP8A1wD-BNcA-NcA-Nf39-f39-f3ZPzXA
+PzU-NcA-NT81wD81PzXAPzX9-f39-f392T81wD81PzXAPzU-NcA-NT81wD81-f39-f39-cU-wjU-
+wjU-wjXEP8E1wD81wD81PzXAPzXAP8E1xD-CNT-CNT-CNf39-f39-f3FPzXAPzU-NcA-NT81wD81
+wj81-f39-f39-cU-wjU-wjU-wjXEPzXAPzU-NcA-NT81wD81wj81xD-CNT-CNT-CNf39-f39-f3F
+P8E1wT-ANcA-wTXAP8E1-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f3EPzXA
+PzU-wjU-NcI-NcM-wDXFPzXBPzXAP8A1wD-BNcA-NcI-wTXBPzX9-f39-f3wPzXAPzU-NcI-NcI-
+NcI-NcA-NcQ-NcE-NT81wD81PzXAPzU-NcI-NcA-NcA-Nf39-f39-fA-NcA-NT81wj81wj81wj81
+wD81xD81wT81PzXAPzU-NcA-NT81wj81wD81wD81-f39-f398D-CNT-BNcA-NcI-NcI-NcA-NcQ-
+NT81PzU-NcA-NT-BNcA-NcI-NcA-NcA-Nf39-f39-fA-NcA-NT81wj81wj81wj81wD81xD81PzU-
+NT81wD81PzXAPzU-NcI-NcA-NcA-Nf39-f39-fA-NcA-NT81wj81wj81wj81wD81xD-ANT-ANT81
+wD81PzXAPzU-NcI-NcA-Nf39-f39-fM-NcA-NT-CNT-CNT-CNcA-wDXFPzXBPzXAP8A1wD81wD81
+P8I1P8E1wT81-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39yf7-d6jDNf39-f39-f3a-sLDxzXKHcM1-f39-f39-do7NcE-NcYd
+wzX9-f39-f392Ts1wz81xR3DNf39-f39-f3ZOzXEPzXEHcM1-f39-f39-dg7NcQ-NcUdwzX9-f39
+-f392Ds1wz81xh3DNf39-f39-f3nHcM1-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39
+-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f39-f3aAAAAAAAAAAE=
+:: .info.pod
+b64$LS1bW3BvZCxhdXRob3I9Im5vY3RvbmljIixjcmVhdGVkPSIyMDI1LTA3LTI3IDEwOjEwOjEw
+IixpY29uPXVzZXJkYXRhKCJ1OCIsMTYsMTYsIjAxMDEwMTAxMDEwMTAxMDEwMTAxMDEwMTAxMDEw
+MTAxMDEwMTA2MDYwNjA2MDEwMTAxMDEwMTA2MDYwNjAxMDEwMTAxMDYwMTAxMDYwNjAxMDEwMTA2
+MDEwMTA2MDYwMTAxMDEwNjAxMDEwMTA2MDEwMTA2MDYwMTAxMDEwNjAxMDEwMTA2MDYwMTA2MDYw
+MTAxMDYwNjA2MDEwMTA2MDEwMTAxMDEwNjA2MDYwNjA2MDYwNjA2MDYwNjA2MDYwMTAxMDYwNjA2
+MDYwNjA2MDYwNjA2MDYwNjA2MDYwNjAxMDEwNjA2MDYwNjA2MDYwNjA2MDYwNjAxMDEwNjA2MDEw
+NjA2MDEwMTA2MDYwNjA2MDYwNjAxMDEwMTAxMDYwMTA2MDYwMTAxMDYwNjA2MDYwNjA2MDYwMTAx
+MDYwNjAxMDEwNjA2MDYwNjA2MDYwMTA2MDYwNjA2MDYwNjA2MDEwMTAxMDYwNjA2MDYwNjA2MDYw
+NjA2MDYwNjA2MDEwMTAxMDEwMTAxMDYwNjA2MDYwNjA2MDYwNjA2MDEwMTAxMDEwNjA2MDEwMTAx
+MDYwNjA2MDYwNjAxMDEwMTA2MDYwNjA2MDYwNjAxMDEwMTAxMDEwMTAxMDEwMTA2MDYwNjA2MDYw
+NjA2MDYwNjA2MDYwNjA2MDYwNjA2MDYwNjA2IiksbW9kaWZpZWQ9IjIwMjUtMDctMjcgMTA6MTA6
+MTAiLG5vdGVzPSJUTFMxLjMgXG54MjU1MTkgY2hhY2hhMjAgcG9seTEzMDUgc2hhMjU2IixydW50
+aW1lPTIwLHRpdGxlPSJQaWNvVExTIix2ZXJzaW9uPSIwLjEiLHdvcmtzcGFjZXM9e3tsb2NhdGlv
+bj0ibWFpbi5sdWEjMCIsd29ya3NwYWNlX2luZGV4PTF9LHtsb2NhdGlvbj0iZ2Z4LzAuZ2Z4Iix3
+b3Jrc3BhY2VfaW5kZXg9Mn0se2xvY2F0aW9uPSJtYXAvMC5tYXAiLHdvcmtzcGFjZV9pbmRleD0z
+fSx7bG9jYXRpb249InNmeC8wLnNmeCIsd29ya3NwYWNlX2luZGV4PTR9fV1d
+:: [eoc]
